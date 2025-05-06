@@ -1,5 +1,6 @@
 import { WebContainer } from '@webcontainer/api';
 import { WORK_DIR_NAME } from '~/utils/constants';
+import { cleanStackTrace } from '~/utils/stacktrace';
 
 interface WebContainerContext {
   loaded: boolean;
@@ -22,10 +23,49 @@ if (!import.meta.env.SSR) {
     import.meta.hot?.data.webcontainer ??
     Promise.resolve()
       .then(() => {
-        return WebContainer.boot({ workdirName: WORK_DIR_NAME });
+        return WebContainer.boot({
+          coep: 'credentialless',
+          workdirName: WORK_DIR_NAME,
+          forwardPreviewErrors: true, // Enable error forwarding from iframes
+        });
       })
-      .then((webcontainer) => {
+      .then(async (webcontainer) => {
         webcontainerContext.loaded = true;
+
+        const { workbenchStore } = await import('~/lib/stores/workbench');
+
+        // Listen for preview errors
+        webcontainer.on('preview-message', (message) => {
+          console.log('WebContainer preview message:', message);
+
+          // Handle both uncaught exceptions and unhandled promise rejections
+          if (
+            message.type === 'PREVIEW_UNCAUGHT_EXCEPTION' ||
+            message.type === 'PREVIEW_UNHANDLED_REJECTION' ||
+            message.type === 'PREVIEW_CONSOLE_ERROR'
+          ) {
+            const isPromise = message.type === 'PREVIEW_UNHANDLED_REJECTION';
+            const isConsoleError = message.type === 'PREVIEW_CONSOLE_ERROR';
+            const title = isPromise
+              ? 'Unhandled Promise Rejection'
+              : isConsoleError
+                ? 'Console Error'
+                : 'Uncaught Exception';
+            workbenchStore.actionAlert.set({
+              type: 'preview',
+              title,
+              description:
+                'message' in message
+                  ? message.message
+                  : 'args' in message && Array.isArray(message.args) && message.args.length > 0
+                    ? message.args[0]
+                    : 'Unknown error',
+              content: `Error occurred at ${message.pathname}${message.search}${message.hash}\nPort: ${message.port}\n\nStack trace:\n${cleanStackTrace(message.stack || '')}`,
+              source: 'preview',
+            });
+          }
+        });
+
         return webcontainer;
       });
 

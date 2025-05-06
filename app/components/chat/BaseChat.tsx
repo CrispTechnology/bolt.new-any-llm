@@ -2,17 +2,17 @@
  * @ts-nocheck
  * Preventing TS checks with files presented in the video for a better presentation.
  */
-import type { Message } from 'ai';
+import type { JSONValue, Message } from 'ai';
 import React, { type RefCallback, useEffect, useState } from 'react';
 import { ClientOnly } from 'remix-utils/client-only';
 import { Menu } from '~/components/sidebar/Menu.client';
 import { IconButton } from '~/components/ui/IconButton';
 import { Workbench } from '~/components/workbench/Workbench.client';
 import { classNames } from '~/utils/classNames';
-import { MODEL_LIST, PROVIDER_LIST, initializeModelList } from '~/utils/constants';
+import { PROVIDER_LIST } from '~/utils/constants';
 import { Messages } from './Messages.client';
 import { SendButton } from './SendButton.client';
-import { APIKeyManager } from './APIKeyManager';
+import { APIKeyManager, getApiKeysFromCookies } from './APIKeyManager';
 import Cookies from 'js-cookie';
 import * as Tooltip from '@radix-ui/react-tooltip';
 
@@ -25,11 +25,24 @@ import GitCloneButton from './GitCloneButton';
 import FilePreview from './FilePreview';
 import { ModelSelector } from '~/components/chat/ModelSelector';
 import { SpeechRecognitionButton } from '~/components/chat/SpeechRecognition';
-import type { IProviderSetting, ProviderInfo } from '~/types/model';
+import type { ProviderInfo } from '~/types/model';
 import { ScreenshotStateManager } from './ScreenshotStateManager';
 import { toast } from 'react-toastify';
-import type { ActionAlert } from '~/types/actions';
+import StarterTemplates from './StarterTemplates';
+import type { ActionAlert, SupabaseAlert, DeployAlert } from '~/types/actions';
+import DeployChatAlert from '~/components/deploy/DeployAlert';
 import ChatAlert from './ChatAlert';
+import type { ModelInfo } from '~/lib/modules/llm/types';
+import ProgressCompilation from './ProgressCompilation';
+import type { ProgressAnnotation } from '~/types/context';
+import type { ActionRunner } from '~/lib/runtime/action-runner';
+import { LOCAL_PROVIDERS } from '~/lib/stores/settings';
+import { SupabaseChatAlert } from '~/components/chat/SupabaseAlert';
+import { SupabaseConnection } from './SupabaseConnection';
+import { ExpoQrModal } from '~/components/workbench/ExpoQrModal';
+import { expoUrlAtom } from '~/lib/stores/qrCodeStore';
+import { useStore } from '@nanostores/react';
+import { StickToBottom, useStickToBottomContext } from '~/lib/hooks';
 
 const TEXTAREA_MIN_HEIGHT = 76;
 
@@ -40,6 +53,7 @@ interface BaseChatProps {
   showChat?: boolean;
   chatStarted?: boolean;
   isStreaming?: boolean;
+  onStreamingChange?: (streaming: boolean) => void;
   messages?: Message[];
   description?: string;
   enhancingPrompt?: boolean;
@@ -62,17 +76,22 @@ interface BaseChatProps {
   setImageDataList?: (dataList: string[]) => void;
   actionAlert?: ActionAlert;
   clearAlert?: () => void;
+  supabaseAlert?: SupabaseAlert;
+  clearSupabaseAlert?: () => void;
+  deployAlert?: DeployAlert;
+  clearDeployAlert?: () => void;
+  data?: JSONValue[] | undefined;
+  actionRunner?: ActionRunner;
 }
 
 export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
   (
     {
       textareaRef,
-      messageRef,
-      scrollRef,
       showChat = true,
       chatStarted = false,
       isStreaming = false,
+      onStreamingChange,
       model,
       setModel,
       provider,
@@ -95,81 +114,50 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
       messages,
       actionAlert,
       clearAlert,
+      deployAlert,
+      clearDeployAlert,
+      supabaseAlert,
+      clearSupabaseAlert,
+      data,
+      actionRunner,
     },
     ref,
   ) => {
     const TEXTAREA_MAX_HEIGHT = chatStarted ? 400 : 200;
-    const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => {
-      const savedKeys = Cookies.get('apiKeys');
-
-      if (savedKeys) {
-        try {
-          return JSON.parse(savedKeys);
-        } catch (error) {
-          console.error('Failed to parse API keys from cookies:', error);
-          return {};
-        }
-      }
-
-      return {};
-    });
-    const [modelList, setModelList] = useState(MODEL_LIST);
+    const [apiKeys, setApiKeys] = useState<Record<string, string>>(getApiKeysFromCookies());
+    const [modelList, setModelList] = useState<ModelInfo[]>([]);
     const [isModelSettingsCollapsed, setIsModelSettingsCollapsed] = useState(false);
     const [isListening, setIsListening] = useState(false);
     const [recognition, setRecognition] = useState<SpeechRecognition | null>(null);
     const [transcript, setTranscript] = useState('');
+    const [isModelLoading, setIsModelLoading] = useState<string | undefined>('all');
+    const [progressAnnotations, setProgressAnnotations] = useState<ProgressAnnotation[]>([]);
+    const expoUrl = useStore(expoUrlAtom);
+    const [qrModalOpen, setQrModalOpen] = useState(false);
 
+    useEffect(() => {
+      if (expoUrl) {
+        setQrModalOpen(true);
+      }
+    }, [expoUrl]);
+
+    useEffect(() => {
+      if (data) {
+        const progressList = data.filter(
+          (x) => typeof x === 'object' && (x as any).type === 'progress',
+        ) as ProgressAnnotation[];
+        setProgressAnnotations(progressList);
+      }
+    }, [data]);
     useEffect(() => {
       console.log(transcript);
     }, [transcript]);
 
     useEffect(() => {
-      // Load API keys from cookies on component mount
+      onStreamingChange?.(isStreaming);
+    }, [isStreaming, onStreamingChange]);
 
-      let parsedApiKeys: Record<string, string> | undefined = {};
-
-      try {
-        const storedApiKeys = Cookies.get('apiKeys');
-
-        if (storedApiKeys) {
-          const parsedKeys = JSON.parse(storedApiKeys);
-
-          if (typeof parsedKeys === 'object' && parsedKeys !== null) {
-            setApiKeys(parsedKeys);
-            parsedApiKeys = parsedKeys;
-          }
-        }
-      } catch (error) {
-        console.error('Error loading API keys from cookies:', error);
-
-        // Clear invalid cookie data
-        Cookies.remove('apiKeys');
-      }
-
-      let providerSettings: Record<string, IProviderSetting> | undefined = undefined;
-
-      try {
-        const savedProviderSettings = Cookies.get('providers');
-
-        if (savedProviderSettings) {
-          const parsedProviderSettings = JSON.parse(savedProviderSettings);
-
-          if (typeof parsedProviderSettings === 'object' && parsedProviderSettings !== null) {
-            providerSettings = parsedProviderSettings;
-          }
-        }
-      } catch (error) {
-        console.error('Error loading Provider Settings from cookies:', error);
-
-        // Clear invalid cookie data
-        Cookies.remove('providers');
-      }
-
-      initializeModelList({ apiKeys: parsedApiKeys, providerSettings }).then((modelList) => {
-        console.log('Model List: ', modelList);
-        setModelList(modelList);
-      });
-
+    useEffect(() => {
       if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         const recognition = new SpeechRecognition();
@@ -200,6 +188,59 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
         setRecognition(recognition);
       }
     }, []);
+
+    useEffect(() => {
+      if (typeof window !== 'undefined') {
+        let parsedApiKeys: Record<string, string> | undefined = {};
+
+        try {
+          parsedApiKeys = getApiKeysFromCookies();
+          setApiKeys(parsedApiKeys);
+        } catch (error) {
+          console.error('Error loading API keys from cookies:', error);
+          Cookies.remove('apiKeys');
+        }
+
+        setIsModelLoading('all');
+        fetch('/api/models')
+          .then((response) => response.json())
+          .then((data) => {
+            const typedData = data as { modelList: ModelInfo[] };
+            setModelList(typedData.modelList);
+          })
+          .catch((error) => {
+            console.error('Error fetching model list:', error);
+          })
+          .finally(() => {
+            setIsModelLoading(undefined);
+          });
+      }
+    }, [providerList, provider]);
+
+    const onApiKeysChange = async (providerName: string, apiKey: string) => {
+      const newApiKeys = { ...apiKeys, [providerName]: apiKey };
+      setApiKeys(newApiKeys);
+      Cookies.set('apiKeys', JSON.stringify(newApiKeys));
+
+      setIsModelLoading(providerName);
+
+      let providerModels: ModelInfo[] = [];
+
+      try {
+        const response = await fetch(`/api/models/${encodeURIComponent(providerName)}`);
+        const data = await response.json();
+        providerModels = (data as { modelList: ModelInfo[] }).modelList;
+      } catch (error) {
+        console.error('Error loading dynamic models for:', providerName, error);
+      }
+
+      // Only update models for the specific provider
+      setModelList((prevModels) => {
+        const otherModels = prevModels.filter((model) => model.provider !== providerName);
+        return [...otherModels, ...providerModels];
+      });
+      setIsModelLoading(undefined);
+    };
 
     const startListening = () => {
       if (recognition) {
@@ -294,7 +335,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
         data-chat-visible={showChat}
       >
         <ClientOnly>{() => <Menu />}</ClientOnly>
-        <div ref={scrollRef} className="flex flex-col lg:flex-row overflow-y-auto w-full h-full">
+        <div className="flex flex-col lg:flex-row overflow-y-auto w-full h-full">
           <div className={classNames(styles.Chat, 'flex flex-col flex-grow lg:min-w-[var(--chat-min-width)] h-full')}>
             {!chatStarted && (
               <div id="intro" className="mt-[16vh] max-w-chat mx-auto text-center px-4 lg:px-0">
@@ -306,29 +347,52 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                 </p>
               </div>
             )}
-            <div
-              className={classNames('pt-6 px-2 sm:px-6', {
-                'h-full flex flex-col': chatStarted,
+            <StickToBottom
+              className={classNames('pt-6 px-2 sm:px-6 relative', {
+                'h-full flex flex-col modern-scrollbar': chatStarted,
               })}
+              resize="smooth"
+              initial="smooth"
             >
-              <ClientOnly>
-                {() => {
-                  return chatStarted ? (
-                    <Messages
-                      ref={messageRef}
-                      className="flex flex-col w-full flex-1 max-w-chat pb-6 mx-auto z-1"
-                      messages={messages}
-                      isStreaming={isStreaming}
-                    />
-                  ) : null;
-                }}
-              </ClientOnly>
+              <StickToBottom.Content className="flex flex-col gap-4">
+                <ClientOnly>
+                  {() => {
+                    return chatStarted ? (
+                      <Messages
+                        className="flex flex-col w-full flex-1 max-w-chat pb-6 mx-auto z-1"
+                        messages={messages}
+                        isStreaming={isStreaming}
+                      />
+                    ) : null;
+                  }}
+                </ClientOnly>
+              </StickToBottom.Content>
               <div
-                className={classNames('flex flex-col gap-4 w-full max-w-chat mx-auto z-prompt mb-6', {
+                className={classNames('my-auto flex flex-col gap-2 w-full max-w-chat mx-auto z-prompt mb-6', {
                   'sticky bottom-2': chatStarted,
                 })}
               >
-                <div className="bg-bolt-elements-background-depth-2">
+                <div className="flex flex-col gap-2">
+                  {deployAlert && (
+                    <DeployChatAlert
+                      alert={deployAlert}
+                      clearAlert={() => clearDeployAlert?.()}
+                      postMessage={(message: string | undefined) => {
+                        sendMessage?.({} as any, message);
+                        clearSupabaseAlert?.();
+                      }}
+                    />
+                  )}
+                  {supabaseAlert && (
+                    <SupabaseChatAlert
+                      alert={supabaseAlert}
+                      clearAlert={() => clearSupabaseAlert?.()}
+                      postMessage={(message) => {
+                        sendMessage?.({} as any, message);
+                        clearSupabaseAlert?.();
+                      }}
+                    />
+                  )}
                   {actionAlert && (
                     <ChatAlert
                       alert={actionAlert}
@@ -340,9 +404,11 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                     />
                   )}
                 </div>
+                <ScrollToBottom />
+                {progressAnnotations && <ProgressCompilation data={progressAnnotations} />}
                 <div
                   className={classNames(
-                    'bg-bolt-elements-background-depth-2 p-3 rounded-lg border border-bolt-elements-borderColor relative w-full max-w-chat mx-auto z-prompt',
+                    'relative bg-bolt-elements-background-depth-2 p-3 rounded-lg border border-bolt-elements-borderColor relative w-full max-w-chat mx-auto z-prompt',
 
                     /*
                      * {
@@ -378,29 +444,34 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                     <rect className={classNames(styles.PromptShine)} x="48" y="24" width="70" height="1"></rect>
                   </svg>
                   <div>
-                    <div className={isModelSettingsCollapsed ? 'hidden' : ''}>
-                      <ModelSelector
-                        key={provider?.name + ':' + modelList.length}
-                        model={model}
-                        setModel={setModel}
-                        modelList={modelList}
-                        provider={provider}
-                        setProvider={setProvider}
-                        providerList={providerList || (PROVIDER_LIST as ProviderInfo[])}
-                        apiKeys={apiKeys}
-                      />
-                      {(providerList || []).length > 0 && provider && (
-                        <APIKeyManager
-                          provider={provider}
-                          apiKey={apiKeys[provider.name] || ''}
-                          setApiKey={(key) => {
-                            const newApiKeys = { ...apiKeys, [provider.name]: key };
-                            setApiKeys(newApiKeys);
-                            Cookies.set('apiKeys', JSON.stringify(newApiKeys));
-                          }}
-                        />
+                    <ClientOnly>
+                      {() => (
+                        <div className={isModelSettingsCollapsed ? 'hidden' : ''}>
+                          <ModelSelector
+                            key={provider?.name + ':' + modelList.length}
+                            model={model}
+                            setModel={setModel}
+                            modelList={modelList}
+                            provider={provider}
+                            setProvider={setProvider}
+                            providerList={providerList || (PROVIDER_LIST as ProviderInfo[])}
+                            apiKeys={apiKeys}
+                            modelLoading={isModelLoading}
+                          />
+                          {(providerList || []).length > 0 &&
+                            provider &&
+                            (!LOCAL_PROVIDERS.includes(provider.name) || 'OpenAILike') && (
+                              <APIKeyManager
+                                provider={provider}
+                                apiKey={apiKeys[provider.name] || ''}
+                                setApiKey={(key) => {
+                                  onApiKeysChange(provider.name, key);
+                                }}
+                              />
+                            )}
+                        </div>
                       )}
-                    </div>
+                    </ClientOnly>
                   </div>
                   <FilePreview
                     files={uploadedFiles}
@@ -564,28 +635,43 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                           a new line
                         </div>
                       ) : null}
+                      <SupabaseConnection />
+                      <ExpoQrModal open={qrModalOpen} onClose={() => setQrModalOpen(false)} />
                     </div>
                   </div>
                 </div>
               </div>
-            </div>
-            {!chatStarted && (
-              <div className="flex justify-center gap-2">
-                {ImportButtons(importChat)}
-                <GitCloneButton importChat={importChat} />
-              </div>
-            )}
-            {!chatStarted &&
-              ExamplePrompts((event, messageInput) => {
-                if (isStreaming) {
-                  handleStop?.();
-                  return;
-                }
+            </StickToBottom>
+            <div className="flex flex-col justify-center">
+              {!chatStarted && (
+                <div className="flex justify-center gap-2">
+                  {ImportButtons(importChat)}
+                  <GitCloneButton importChat={importChat} />
+                </div>
+              )}
+              <div className="flex flex-col gap-5">
+                {!chatStarted &&
+                  ExamplePrompts((event, messageInput) => {
+                    if (isStreaming) {
+                      handleStop?.();
+                      return;
+                    }
 
-                handleSendMessage?.(event, messageInput);
-              })}
+                    handleSendMessage?.(event, messageInput);
+                  })}
+                {!chatStarted && <StarterTemplates />}
+              </div>
+            </div>
           </div>
-          <ClientOnly>{() => <Workbench chatStarted={chatStarted} isStreaming={isStreaming} />}</ClientOnly>
+          <ClientOnly>
+            {() => (
+              <Workbench
+                actionRunner={actionRunner ?? ({} as ActionRunner)}
+                chatStarted={chatStarted}
+                isStreaming={isStreaming}
+              />
+            )}
+          </ClientOnly>
         </div>
       </div>
     );
@@ -593,3 +679,19 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
     return <Tooltip.Provider delayDuration={200}>{baseChat}</Tooltip.Provider>;
   },
 );
+
+function ScrollToBottom() {
+  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+
+  return (
+    !isAtBottom && (
+      <button
+        className="absolute z-50 top-[0%] translate-y-[-100%] text-4xl rounded-lg left-[50%] translate-x-[-50%] px-1.5 py-0.5 flex items-center gap-2 bg-bolt-elements-background-depth-3 border border-bolt-elements-borderColor text-bolt-elements-textPrimary text-sm"
+        onClick={() => scrollToBottom()}
+      >
+        Go to last message
+        <span className="i-ph:arrow-down animate-bounce" />
+      </button>
+    )
+  );
+}
